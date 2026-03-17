@@ -71,10 +71,13 @@ class BotConfig:
     # EN: Required edge vs implied probability before entering.
     # KO: 진입 전 요구되는 확률 우위.
     min_edge: float = 0.08
+    # EN: Softer edge for partial-alignment setups so bot actually trades.
+    # KO: 부분 정렬 셋업에도 거래가 나오도록 완화된 엣지 임계값.
+    min_edge_soft: float = 0.03
 
     # EN: Minimum Polymarket liquidity filter.
     # KO: 최소 유동성 필터.
-    min_volume_usd: float = 50_000.0
+    min_volume_usd: float = 5_000.0
 
     # EN: Local trade log output file.
     # KO: 거래 로그 CSV 출력 파일.
@@ -141,7 +144,7 @@ class AstroData:
                 low = col.lower()
                 if any(k in low for k in ["date", "time", "start", "end", "ingress", "timestamp"]):
                     try:
-                        parsed = pd.to_datetime(df[col], errors="coerce")
+                        parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
                         if parsed.notna().sum() == 0:
                             continue
                         if getattr(parsed.dt, "tz", None) is None:
@@ -163,9 +166,14 @@ class AstroData:
         daily = self.master_df.copy()
         daily["_d"] = pd.to_datetime(daily[date_col], errors="coerce").dt.date
         rows = daily[daily["_d"] == now_et.date()]
-        if rows.empty:
+        if not rows.empty:
+            return rows.iloc[-1]
+        # EN: If exact date missing, pick nearest historical row to keep bias engine live.
+        # KO: 정확한 날짜가 없으면 가장 가까운 과거 행을 선택해 바이어스 엔진 유지.
+        older = daily[daily["_d"] <= now_et.date()]
+        if older.empty:
             return None
-        return rows.iloc[-1]
+        return older.sort_values("_d").iloc[-1]
 
     def in_voc_window(self, now_et: dt.datetime) -> bool:
         # EN: VOC filter is strict no-trade zone for win-rate protection.
@@ -326,7 +334,7 @@ class BTCData:
         ], axis=1).max(axis=1)
         out["atr14"] = tr.rolling(14).mean()
         out["vol_ma20"] = out["volume"].rolling(20).mean()
-        out["volume_spike"] = out["volume"] > (1.5 * out["vol_ma20"])
+        out["volume_spike"] = out["volume"] > (1.3 * out["vol_ma20"])
         return out
 
     @staticmethod
@@ -341,8 +349,11 @@ class BTCData:
         bullish_cross = prev["stoch_k"] < prev["stoch_d"] and last["stoch_k"] > last["stoch_d"]
         bearish_cross = prev["stoch_k"] > prev["stoch_d"] and last["stoch_k"] < last["stoch_d"]
 
-        bullish = bullish_cross and last["stoch_k"] < 30 and last["cci"] > -100 and bool(last["volume_spike"])
-        bearish = bearish_cross and last["stoch_k"] > 70 and last["cci"] < 100 and bool(last["volume_spike"])
+        # EN: Relaxed trigger to increase fill-rate while preserving direction quality.
+        # KO: 방향 품질은 유지하면서 체결 빈도를 높이기 위한 완화 트리거.
+        vol_ok = bool(last["volume_spike"]) or bool(last["volume"] > last["vol_ma20"])
+        bullish = bullish_cross and last["stoch_k"] < 35 and last["cci"] > -120 and vol_ok
+        bearish = bearish_cross and last["stoch_k"] > 65 and last["cci"] < 120 and vol_ok
 
         if bullish:
             return 1
@@ -357,6 +368,53 @@ class PolymarketClient:
 
     BASE_URL = "https://gamma-api.polymarket.com"
 
+    @staticmethod
+    def _to_float(value: object, default: float = 0.0) -> float:
+        # EN: Safely cast polymarket numeric variants to float.
+        # KO: Polymarket 숫자 필드 변형을 안전하게 float 변환.
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _extract_volume(self, market: dict) -> float:
+        # EN: Aggregate possible volume/liquidity fields for robust filtering.
+        # KO: 다양한 거래량/유동성 필드를 합산해 필터 견고성 확보.
+        candidates = [
+            market.get("volume"),
+            market.get("volumeNum"),
+            market.get("volume24hr"),
+            market.get("liquidity"),
+            market.get("liquidityNum"),
+            market.get("clobTokenVolume"),
+        ]
+        return max(self._to_float(v) for v in candidates)
+
+    def _extract_end_time_et(self, market: dict) -> Optional[dt.datetime]:
+        # EN: Parse all known market end-time fields and return ET-aware datetime.
+        # KO: 알려진 종료시각 필드를 순차 파싱하여 ET aware datetime 반환.
+        for key in ["endDate", "endTime", "end_time", "resolution_time", "expirationTime"]:
+            raw = market.get(key)
+            if raw is None:
+                continue
+            parsed = pd.to_datetime(raw, errors="coerce", utc=True)
+            if pd.notna(parsed):
+                return parsed.tz_convert(ET).to_pydatetime()
+        return None
+
+    def _is_btc_market(self, market: dict) -> bool:
+        # EN: Identify BTC markets using question/title/slug/ticker fields.
+        # KO: question/title/slug/ticker 기반 BTC 시장 판별.
+        text_fields = [
+            str(market.get("question", "")),
+            str(market.get("title", "")),
+            str(market.get("slug", "")),
+            str(market.get("ticker", "")),
+            str(market.get("description", "")),
+        ]
+        blob = " ".join(text_fields).lower()
+        return ("bitcoin" in blob) or ("btc" in blob)
+
     def _request(self, path: str, params: Optional[dict] = None) -> list | dict:
         # EN: Centralized request handler to simplify retries and observability.
         # KO: 재시도/관측을 단순화하는 중앙 요청 핸들러.
@@ -368,37 +426,49 @@ class PolymarketClient:
     def find_active_5m_btc_market(self, now_et: dt.datetime, min_volume: float) -> Optional[dict]:
         # EN: Select active BTC Up/Down market resolving in about 5 minutes with liquidity filter.
         # KO: 약 5분 뒤 종료되고 유동성이 충분한 BTC Up/Down 활성 시장 선택.
-        data = self._request("/markets", params={"limit": 200, "active": True})
-        if isinstance(data, dict):
-            markets = data.get("data", [])
-        else:
-            markets = data
+        # EN: Query both broad and filtered views because gamma payloads vary by deployment.
+        # KO: 배포별 gamma 응답 차이를 감안해 넓은 조회와 필터 조회를 함께 수행.
+        candidates = []
+        queries = [
+            {"limit": 400, "active": True, "closed": False, "archived": False},
+            {"limit": 400, "active": True},
+        ]
+        for params in queries:
+            data = self._request("/markets", params=params)
+            markets = data.get("data", []) if isinstance(data, dict) else data
+            candidates.extend(markets)
 
-        best = None
-        for m in markets:
-            q = str(m.get("question", "")).lower()
-            if "bitcoin" not in q and "btc" not in q:
-                continue
-            if "next 5 minutes" not in q and "5 minutes" not in q:
-                continue
+        # EN: Deduplicate by market id.
+        # KO: market id 기준 중복 제거.
+        uniq = {}
+        for m in candidates:
+            mid = str(m.get("id", m.get("conditionId", m.get("slug", ""))))
+            uniq[mid] = m
 
-            vol = float(m.get("volume", m.get("volumeNum", 0)) or 0)
+        scored: List[Tuple[float, dict]] = []
+        for m in uniq.values():
+            if not self._is_btc_market(m):
+                continue
+            end_et = self._extract_end_time_et(m)
+            if end_et is None:
+                continue
+            mins_to_end = (end_et - now_et).total_seconds() / 60
+            # EN: Relax from strict 4~6 to 1~9 minutes and score closeness to 5m.
+            # KO: 기존 4~6분에서 1~9분으로 완화하고 5분 근접도 점수화.
+            if not (1.0 <= mins_to_end <= 9.0):
+                continue
+            vol = self._extract_volume(m)
             if vol < min_volume:
                 continue
+            # EN: Prefer exact 5m expiry and larger volume.
+            # KO: 5분 만기 근접 + 높은 거래량 우선.
+            score = -abs(mins_to_end - 5.0) + math.log1p(vol) * 0.03
+            scored.append((score, m))
 
-            end_raw = m.get("endDate") or m.get("end_time") or m.get("endTime")
-            if not end_raw:
-                continue
-            end_dt = pd.to_datetime(end_raw, utc=True, errors="coerce")
-            if pd.isna(end_dt):
-                continue
-            end_et = end_dt.tz_convert(ET).to_pydatetime()
-            mins = (end_et - now_et).total_seconds() / 60
-            if not (4.0 <= mins <= 6.0):
-                continue
-            best = m
-            break
-        return best
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1]
 
     def current_yes_no(self, market: dict) -> Tuple[Optional[float], Optional[float]]:
         # EN: Parse best-available yes/no probabilities from gamma market payload.
@@ -489,10 +559,10 @@ class StrategyEngine:
                 "half_size": half_size,
             }
 
-        if astro_bias == 0 or micro_dir == 0 or astro_bias != micro_dir:
+        if astro_bias == 0 and micro_dir == 0:
             return {
                 "action": "SKIP",
-                "reason": "Astro and micro trigger not aligned",
+                "reason": "No astro or micro signal",
                 "confidence": 0.0,
                 "edge": 0.0,
                 "half_size": half_size,
@@ -503,29 +573,35 @@ class StrategyEngine:
         edge_yes = model_p_yes - market_implied_yes
         edge_no = (1 - model_p_yes) - float(market_no)
 
-        if astro_bias == 1 and edge_yes > self.config.min_edge:
+        aligned = astro_bias != 0 and micro_dir != 0 and astro_bias == micro_dir
+        edge_threshold = self.config.min_edge if aligned else self.config.min_edge_soft
+
+        if model_p_yes >= 0.5 and edge_yes > edge_threshold:
             return {
                 "action": "BUY_YES",
-                "reason": "All filters aligned + positive edge",
+                "reason": "Positive edge with astro/micro blend",
                 "confidence": round(model_p_yes * 100, 2),
                 "edge": round(edge_yes * 100, 2),
                 "half_size": half_size,
+                "edge_threshold": round(edge_threshold * 100, 2),
             }
-        if astro_bias == -1 and edge_no > self.config.min_edge:
+        if model_p_yes < 0.5 and edge_no > edge_threshold:
             return {
                 "action": "BUY_NO",
-                "reason": "All filters aligned + positive edge",
+                "reason": "Positive edge with astro/micro blend",
                 "confidence": round((1 - model_p_yes) * 100, 2),
                 "edge": round(edge_no * 100, 2),
                 "half_size": half_size,
+                "edge_threshold": round(edge_threshold * 100, 2),
             }
 
         return {
             "action": "SKIP",
-            "reason": "Edge below 8% threshold",
+            "reason": f"Edge below threshold {edge_threshold:.2%}",
             "confidence": round(max(model_p_yes, 1 - model_p_yes) * 100, 2),
             "edge": round(max(edge_yes, edge_no) * 100, 2),
             "half_size": half_size,
+            "edge_threshold": round(edge_threshold * 100, 2),
         }
 
 
