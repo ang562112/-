@@ -1,0 +1,38 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #0b1020;
+  color: #e7ecff;
+}
+
+main {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 2rem 1rem 4rem;
+}
+
+.card {
+  border: 1px solid #2b3358;
+  border-radius: 12px;
+  background: #131a34;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+
+input, button {
+  border-radius: 8px;
+  border: 1px solid #33417a;
+  background: #0f1632;
+  color: #f2f5ff;
+  padding: 0.65rem 0.8rem;
+}
+
+button { cursor: pointer; }
+.warn { color: #ffcf66; }
+.ok { color: #87e0a3; }
+.bad { color: #ff8a8a; }
+pre { white-space: pre-wrap; word-break: break-word; }
